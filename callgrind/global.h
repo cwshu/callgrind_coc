@@ -118,6 +118,11 @@ struct _CommandLineOptions {
   Int   verbose;
   ULong verbose_start;
 #endif
+  
+  /* count between Open/Close */
+  Bool collect_openclose;
+  const HChar* collect_openfile;
+  const HChar* collect_closefile;
 };
 
 /*------------------------------------------------------------*/
@@ -818,6 +823,7 @@ extern ULong* CLG_(cost_base);
 #define CLG_DEBUG(x,format,args...)   \
     CLG_DEBUGIF(x) {                  \
       CLG_(print_bbno)();	      \
+      VG_(printf)("CLG_DEBUG(%d): ", x); \
       VG_(printf)(format,##args);     \
     }
 

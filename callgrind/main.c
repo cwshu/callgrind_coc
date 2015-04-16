@@ -100,6 +100,47 @@ static void CLG_(init_statistics)(Statistics* s)
   s->bbcc_clones         = 0;
 }
 
+/*** collect_openclose patch ***/
+static void CLG_(copy_statistics)(Statistics* dest, Statistics* src)
+{
+  dest->call_counter        = src->call_counter;
+  dest->jcnd_counter        = src->jcnd_counter;
+  dest->jump_counter        = src->jump_counter;
+  dest->rec_call_counter    = src->rec_call_counter;
+  dest->ret_counter         = src->ret_counter;
+  dest->bb_executions       = src->bb_executions;
+
+  dest->context_counter     = src->context_counter;
+  dest->bb_retranslations   = src->bb_retranslations;  
+
+  dest->distinct_objs       = src->distinct_objs;
+  dest->distinct_files      = src->distinct_files;
+  dest->distinct_fns        = src->distinct_fns;
+  dest->distinct_contexts   = src->distinct_contexts;
+  dest->distinct_bbs        = src->distinct_bbs;
+  dest->distinct_jccs       = src->distinct_jccs;
+  dest->distinct_bbccs      = src->distinct_bbccs;
+  dest->distinct_instrs     = src->distinct_instrs;
+  dest->distinct_skips      = src->distinct_skips;
+
+  dest->bb_hash_resizes     = src->bb_hash_resizes;
+  dest->bbcc_hash_resizes   = src->bbcc_hash_resizes;
+  dest->jcc_hash_resizes    = src->jcc_hash_resizes;
+  dest->cxt_hash_resizes    = src->cxt_hash_resizes;
+  dest->fn_array_resizes    = src->fn_array_resizes;
+  dest->call_stack_resizes  = src->call_stack_resizes;
+  dest->fn_stack_resizes    = src->fn_stack_resizes;
+
+  dest->full_debug_BBs      = src->full_debug_BBs;
+  dest->file_line_debug_BBs = src->file_line_debug_BBs;
+  dest->fn_name_debug_BBs   = src->fn_name_debug_BBs;
+  dest->no_debug_BBs        = src->no_debug_BBs;
+  dest->bbcc_lru_misses     = src->bbcc_lru_misses;
+  dest->jcc_lru_misses      = src->jcc_lru_misses;
+  dest->cxt_lru_misses      = src->cxt_lru_misses;
+  dest->bbcc_clones         = src->bbcc_clones;
+}                            
+/*** collect_openclose patch end ***/
 
 /*------------------------------------------------------------*/
 /*--- Simple callbacks (not cache similator)               ---*/
@@ -1700,6 +1741,7 @@ Bool CLG_(handle_client_request)(ThreadId tid, UWord *args, UWord *ret)
    return True;
 }
 
+/* Syscall functions - timing and collect_openclose(coc) */
 
 /* Syscall Timing */
 
@@ -1760,6 +1802,202 @@ void CLG_(post_syscalltime)(ThreadId tid, UInt syscallno,
     CLG_(current_state).bbcc->skipped[o+1] += diff;
   }
 }
+
+/*** collect_openclose patch ***/
+
+/* Syscall collect_openclose(coc) */
+#define MAX_CLOSE_FILE_FD 2048
+
+struct int_set {
+    Int items[MAX_CLOSE_FILE_FD];
+    Int size;
+    Int capacity;
+};
+
+void int_set_init(struct int_set* this){
+    this->size = 0;
+    this->capacity = MAX_CLOSE_FILE_FD;
+}
+
+void int_set_add(struct int_set* this, Int num){
+    if (this->size >= this->capacity){
+        return;
+    }
+    this->items[this->size] = num;
+    this->size++;
+}
+
+Bool int_set_is_inset(struct int_set* this, Int num){
+    Int i;
+    for(i=0; i<this->size; i++){
+        if (this->items[i] == num){
+            return True;
+        }
+    }
+    return False;
+}
+
+Bool int_set_remove(struct int_set* this, Int num){
+    if (this->size == 0){
+        return False;
+    }
+
+    Int i;
+    Bool removed = False;
+    for(i=0; i<this->size; i++){
+        if (removed){
+            this->items[i-1] = this->items[i];
+            continue;
+        }
+
+        if (this->items[i] == num){
+            // item[i] is removed.
+            removed = True;
+        }
+    }
+
+    if (removed){
+        this->size--;
+        return True;
+    }
+    return False;
+}
+
+Statistics CLG_(last_close_stat);
+Bool CLG_(open_close_file_current) = False;
+Bool CLG_(dup_close_file_current) = False;
+// Int CLG_(num_of_close_file_fds) = 0;
+// Int CLG_(close_file_fds)[16] = {0};
+struct int_set CLG_(close_file_fds);
+Int CLG_(coc_dbg_level) = 1;
+#if defined(VGP_x86_linux)
+    Int CLG_(sys_open_num) = 5;
+    Int CLG_(sys_close_num) = 6;
+    Int CLG_(sys_dup_num) = 41;
+    Int CLG_(sys_dup2_num) = 63;
+    Int CLG_(sys_dup3_num) = 330;
+#elif defined(VGP_amd64_linux)
+    Int CLG_(sys_open_num) = 2;
+    Int CLG_(sys_close_num) = 3;
+    Int CLG_(sys_dup_num) = 32;
+    Int CLG_(sys_dup2_num) = 33;
+    Int CLG_(sys_dup3_num) = 292;
+#else
+    CLG_DEBUG(CLG_(coc_dbg_level), "Unsupported platform, open()/close() use x86 system call number");
+    Int CLG_(sys_open_num) = 5;
+    Int CLG_(sys_close_num) = 6;
+    Int CLG_(sys_dup_num) = 41;
+    Int CLG_(sys_dup2_num) = 63;
+    Int CLG_(sys_dup3_num) = 330;
+#endif
+
+Bool path_include_filename(const HChar* path, const HChar* filename){
+  /* simple path comparsion 
+   * if path is including filename
+   */
+  const HChar* filename_ptr = filename;
+
+  /* if filename is relative path start with ./, just use filename */
+  if(VG_(strncmp)(filename_ptr, "./", 2) == 0)
+      filename_ptr += 2;
+  
+  Int ret = (Int)VG_(strstr)(path, filename_ptr);
+  return toBool(ret);
+}
+
+static
+void CLG_(pre_syscallcoc)(ThreadId tid, UInt syscallno,
+                           UWord* args, UInt nArgs){
+  /*
+   * need comment.
+   */
+  if (CLG_(clo).collect_openclose){
+    /* count between Open/Close */
+    if (syscallno == CLG_(sys_open_num)){ /* open */
+      CLG_DEBUG(CLG_(coc_dbg_level), "system call open: filename = %s\n", (HChar*)args[0])
+
+      if (path_include_filename((HChar*)args[0], CLG_(clo).collect_openfile)){
+        /* if open input file */
+        CLG_DEBUG(CLG_(coc_dbg_level), "collect openfile open\n");
+        /* start instrumentation */
+        CLG_(set_instrument_state)("COC: open", True);
+      }
+      else if (path_include_filename((HChar*)args[0], CLG_(clo).collect_closefile)){
+        /* if open output file */
+        CLG_DEBUG(CLG_(coc_dbg_level), "collect closefile open\n");
+
+        CLG_(open_close_file_current) = True;
+      }
+    }
+    else if (syscallno == CLG_(sys_close_num)){ /* close */
+      CLG_DEBUG(CLG_(coc_dbg_level), "system call close: fd number = %d\n", (Int)args[0])
+      // CLG_DEBUG(CLG_(coc_dbg_level), "close file fds: %d\n", CLG_(close_file_fds)[0])
+      
+      if (int_set_is_inset(&CLG_(close_file_fds), (Int)args[0])){
+        /* if closing output file */
+        CLG_DEBUG(CLG_(coc_dbg_level), "collect closefile close\n");
+        int_set_remove(&CLG_(close_file_fds), (Int)args[0]);
+        if (CLG_(close_file_fds).size == 0){
+          /* stop instrumentation */
+          CLG_DEBUG(CLG_(coc_dbg_level), "all closefiles are closed\n");
+          CLG_(copy_statistics)(&CLG_(last_close_stat), &CLG_(stat));
+          CLG_(set_instrument_state)("COC: close", False);
+        }
+      }
+    }
+    else if (syscallno == CLG_(sys_dup_num) || syscallno == CLG_(sys_dup2_num) || syscallno == CLG_(sys_dup3_num)){
+      CLG_DEBUG(CLG_(coc_dbg_level), "system call dup: old fd number = %d\n", (Int)args[0])
+      if (int_set_is_inset(&CLG_(close_file_fds), (Int)args[0])){
+        /* if duping output file */
+        CLG_DEBUG(CLG_(coc_dbg_level), "collect closefile dup\n");
+
+        CLG_(dup_close_file_current) = True;
+      }
+    }
+  }
+}
+
+static
+void CLG_(post_syscallcoc)(ThreadId tid, UInt syscallno,
+                            UWord* args, UInt nArgs, SysRes res){
+  if (CLG_(clo).collect_openclose){
+    /* count between Open/Close */
+    if (CLG_(open_close_file_current) == True){ /* open */
+      CLG_DEBUG(CLG_(coc_dbg_level), "collect closefile fd = %d\n", (Int)sr_Res(res))
+      int_set_add(&CLG_(close_file_fds), sr_Res(res));
+      // CLG_(num_of_close_file_fds) = 1;
+      // CLG_(close_file_fds)[0] = sr_Res(res);
+      CLG_(open_close_file_current) = False;
+    }
+    else if (CLG_(dup_close_file_current) == True){ /* dup */
+      if ((Int)sr_Res < 0){
+        CLG_DEBUG(CLG_(coc_dbg_level), "dup failed\n");
+        return;
+      }
+      CLG_DEBUG(CLG_(coc_dbg_level), "collect closefile fd(dup) = %d\n", (Int)sr_Res(res))
+      int_set_add(&CLG_(close_file_fds), sr_Res(res));
+      CLG_(dup_close_file_current) = False;
+    }
+  }
+}
+
+/* Syscall main function - do time and coc */
+
+static
+void CLG_(pre_syscall)(ThreadId tid, UInt syscallno,
+                           UWord* args, UInt nArgs){
+  CLG_(pre_syscallcoc)(tid, syscallno, args, nArgs);
+  CLG_(pre_syscalltime)(tid, syscallno, args, nArgs);
+}
+
+static
+void CLG_(post_syscall)(ThreadId tid, UInt syscallno,
+                            UWord* args, UInt nArgs, SysRes res){
+  CLG_(post_syscalltime)(tid, syscallno, args, nArgs, res);
+  CLG_(post_syscallcoc)(tid, syscallno, args, nArgs, res);
+}
+
+/*** collect_openclose patch end ***/
 
 static UInt ULong_width(ULong n)
 {
@@ -1882,6 +2120,9 @@ void clg_print_stats(void)
 		CLG_(stat).ret_counter);
 }
 
+void use_last_closefile_stat(){
+    CLG_(copy_statistics)(&CLG_(stat), &CLG_(last_close_stat));
+}
 
 static
 void finish(void)
@@ -1898,6 +2139,15 @@ void finish(void)
   /* pop all remaining items from CallStack for correct sum
    */
   CLG_(forall_threads)(unwind_thread);
+
+  /* collect_openclose, using last_closefile_stat
+   */
+  if (CLG_(clo).collect_openclose){
+    if (CLG_(close_file_fds).size == 0){
+      /* closing all */
+      // use_last_closefile_stat();
+    }
+  }
 
   CLG_(dump_profile)(0, False);
 
@@ -2028,6 +2278,15 @@ void CLG_(post_clo_init)(void)
                    (VG_(arg_vgdb_prefix) ? " " : ""),
                    (VG_(arg_vgdb_prefix) ? VG_(arg_vgdb_prefix) : ""));
    }
+
+   if (CLG_(clo).collect_openclose) {
+       CLG_(instrument_state) = False;
+       CLG_(clo).collect_openfile = "input.txt";
+       CLG_(clo).collect_closefile = "output.txt";
+       int_set_init(&CLG_(close_file_fds));
+       CLG_(init_statistics)(&CLG_(last_close_stat));
+   }
+   CLG_DEBUG(CLG_(coc_dbg_level), "collect_openclose is %s.\n", CLG_(clo).collect_openclose?"True":"False");
 }
 
 static
@@ -2059,8 +2318,8 @@ void CLG_(pre_clo_init)(void)
 
     VG_(needs_client_requests)(CLG_(handle_client_request));
     VG_(needs_print_stats)    (clg_print_stats);
-    VG_(needs_syscall_wrapper)(CLG_(pre_syscalltime),
-			       CLG_(post_syscalltime));
+    VG_(needs_syscall_wrapper)(CLG_(pre_syscall),
+			       CLG_(post_syscall));
 
     VG_(track_start_client_code)  ( & clg_start_client_code_callback );
     VG_(track_pre_deliver_signal) ( & CLG_(pre_signal) );
