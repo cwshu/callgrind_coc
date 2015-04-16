@@ -1,0 +1,13 @@
+define c_bt
+    c
+    bt
+end
+
+define fileit
+    file ../inst/bin/valgrind
+end
+
+fileit
+set args --tool=callgrind --callgrind-out-file=callout.file_IOcppOC --collect-openclose=yes ./file_IO
+set breakpoint pending on
+br sync_signalhandler_from_kernel
